@@ -1,0 +1,100 @@
+name: Verify insertCSS permission-scope PoC
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  verify:
+    # WebKit's own build scripts require a real macOS + Xcode toolchain; this is why this runs
+    # on a GitHub-hosted macOS runner instead of locally. macos-latest currently resolves to
+    # macos-26 (Apple Silicon) -- deliberately not pinned to an older image, since macOS 14
+    # runners are already being deprecated by GitHub and Apple expects reports against current
+    # software, not an old snapshot.
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out this repo (patch + README)
+        uses: actions/checkout@v4
+
+      # Deliberately no "ref:" pin here -- this always checks out whatever WebKit main is
+      # *right now*, for the same "test against current, not a stale snapshot" reason as above.
+      - name: Check out current WebKit main
+        uses: actions/checkout@v4
+        with:
+          repository: WebKit/WebKit
+          fetch-depth: 1
+          path: webkit
+
+      - name: Record exactly which WebKit commit this run used
+        working-directory: webkit
+        run: git rev-parse HEAD | tee ../webkit-commit.txt
+
+      # main moves fast, so by the time this actually runs it may have drifted near the
+      # insertion point. Try a clean apply first, then fall back to a fuzzy one; either way,
+      # fail loudly and clearly (rather than silently) if neither works, so it's obvious the
+      # patch needs regenerating against whatever main looks like now.
+      - name: Apply the regression test patch
+        working-directory: webkit
+        run: |
+          if patch -p1 --dry-run < ../exfiltration-poc.patch; then
+            patch -p1 < ../exfiltration-poc.patch
+          elif patch -p1 --fuzz=10 --dry-run < ../exfiltration-poc.patch; then
+            echo "::warning::Clean apply failed, fuzzy apply succeeded -- WebKit main has drifted since the patch was made. Double-check the test still lands in the right place."
+            patch -p1 --fuzz=10 < ../exfiltration-poc.patch
+          else
+            echo "::error::Patch no longer applies at all -- WebKit main has moved too far from 38f193e near this insertion point. The patch needs to be regenerated against current main before this can run."
+            exit 1
+          fi
+
+      - name: Show Xcode version (for the report)
+        run: xcodebuild -version
+
+      # Official WebKit build docs (docs.webkit.org) list this as a required one-time setup
+      # step for Apple platforms -- without it, WebKit's Metal-shader compilation can fail,
+      # but only once the build reaches that point, potentially after a very long wait.
+      # Non-fatal on purpose: some runner images already have this, and a transient catalog
+      # fetch failure here shouldn't kill the whole job before the real build even starts.
+      - name: Ensure the Metal toolchain is installed (required for WebKit's Metal shaders)
+        run: |
+          if out=$(xcodebuild -downloadComponent MetalToolchain 2>&1); then
+            echo "$out"
+          else
+            echo "::warning::Metal toolchain download reported an issue (may already be installed, or this Xcode may not support -downloadComponent): $out"
+          fi
+
+      # This is the slow step. A from-scratch WebKit build commonly takes well over an hour,
+      # sometimes several, even on capable hardware. There is no faster official path to a
+      # TestWebKitAPI binary than building WebKit.framework first.
+      - name: Build WebKit (release)
+        working-directory: webkit
+        # --no-web-rtc skips building/linking the libwebrtc third-party dependency entirely
+        # (confirmed via WebKit's own Tools/Scripts/webkitperl/FeatureList.pm and build-webkit
+        # source -- this isn't a guess). It's unrelated to the extension/insertCSS code under
+        # test, it's what the previous run died compiling, and skipping it should meaningfully
+        # reduce build time and disk usage too, since libwebrtc is one of the largest
+        # third-party components WebKit builds by default.
+        run: Tools/Scripts/build-webkit --release --no-web-rtc
+
+      - name: Build TestWebKitAPI (release)
+        working-directory: webkit
+        run: Tools/Scripts/build-api-tests --release
+
+      - name: Run the new regression test
+        working-directory: webkit
+        run: |
+          set -o pipefail
+          Tools/Scripts/run-api-tests --release \
+            WKWebExtensionAPIScripting.InsertCSSInAllFramesRespectsPerFramePermissions \
+            WKWebExtensionAPIScripting.InsertCSSExfiltratesCrossOriginAttributeData \
+            2>&1 | tee ../test-output.log
+
+      - name: Upload test output + exact commit tested (always, pass or fail)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poc-test-output
+          path: |
+            test-output.log
+            webkit-commit.txt
